@@ -24,6 +24,9 @@ import (
 	"github.com/AdguardTeam/golibs/osutil/executil"
 	"github.com/NYTimes/gziphandler"
 	"github.com/quic-go/quic-go/http3"
+	"golang.org/x/net/http/httpguts"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 // TODO(a.garipov): Make configurable.
@@ -273,16 +276,13 @@ func (web *webAPI) start(ctx context.Context) {
 
 		hdlr = web.auth.middleware().Wrap(hdlr)
 
-		// Enable unencrypted HTTP/2, e.g. for proxies.
-		protocols := &http.Protocols{}
-		protocols.SetUnencryptedHTTP2(true)
-		protocols.SetHTTP1(true)
+		// Enable unencrypted HTTP/2 with prior knowledge, e.g. for proxies.
+		hdlr = newH2CPriorKnowledgeHandler(hdlr)
 
 		// Create a new instance, because the Web is not usable after Shutdown.
 		web.httpServer = &http.Server{
 			Addr:              web.conf.BindAddr.String(),
 			Handler:           hdlr,
-			Protocols:         protocols,
 			ReadTimeout:       web.conf.ReadTimeout,
 			ReadHeaderTimeout: web.conf.ReadHeaderTimeout,
 			WriteTimeout:      web.conf.WriteTimeout,
@@ -305,6 +305,30 @@ func (web *webAPI) start(ctx context.Context) {
 		// We use ErrServerClosed as a sign that we need to rebind on a new
 		// address, so go back to the start of the loop.
 	}
+}
+
+// newH2CPriorKnowledgeHandler returns a handler that serves unencrypted HTTP/2
+// connections established with prior knowledge.  Unlike setting
+// [http.Server.Protocols] to use unencrypted HTTP/2 directly, this lets
+// [http.Server.ReadHeaderTimeout] apply while the HTTP/2 preface is read.
+func newH2CPriorKnowledgeHandler(hdlr http.Handler) (wrapped http.Handler) {
+	h2cHandler := h2c.NewHandler(hdlr, &http2.Server{})
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isH2CUpgrade(r.Header) {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+
+			return
+		}
+
+		h2cHandler.ServeHTTP(w, r)
+	})
+}
+
+// isH2CUpgrade returns true if h contains an HTTP/1.1 h2c upgrade request.
+func isH2CUpgrade(h http.Header) (ok bool) {
+	return httpguts.HeaderValuesContainsToken(h.Values("Upgrade"), "h2c") &&
+		httpguts.HeaderValuesContainsToken(h.Values("Connection"), "Upgrade")
 }
 
 // close gracefully shuts down the HTTP servers.
